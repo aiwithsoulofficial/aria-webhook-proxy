@@ -50,6 +50,15 @@ def get_store():
     return cleaned
 
 
+@app.route("/debug", methods=["GET", "POST", "PUT", "PATCH"])
+def debug():
+    """Debug endpoint - logs everything received."""
+    logger.info(f"DEBUG HIT: {request.method} {request.url}")
+    logger.info(f"Headers: {dict(request.headers)}")
+    logger.info(f"Body: {request.get_data(as_text=True)[:1000]}")
+    return jsonify({"received": True})
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "aria-webhook-proxy", "contacts_cached": len(get_store())})
@@ -59,8 +68,14 @@ def health():
 def trigger_call():
     """Receive GHL webhook, store contact details, trigger ElevenLabs call."""
     try:
-        data = request.json or request.form.to_dict()
-        logger.info(f"Received webhook: {json.dumps(data)}")
+        # Log everything to diagnose GHL format
+        logger.info(f"Content-Type: {request.content_type}")
+        logger.info(f"Raw body: {request.get_data(as_text=True)[:500]}")
+        logger.info(f"Args: {dict(request.args)}")
+        logger.info(f"Form: {dict(request.form)}")
+
+        data = request.json or request.form.to_dict() or dict(request.args)
+        logger.info(f"Parsed data: {json.dumps(data)}")
 
         to_number = (
             data.get("to_number") or
