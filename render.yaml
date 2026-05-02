@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: aria-webhook-proxy
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: XI_API_KEY
+        value: sk_1a2a2a07d19b6f993c0b98203dd355f2938c9f855ba76d97
