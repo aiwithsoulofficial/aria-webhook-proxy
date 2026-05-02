@@ -159,16 +159,13 @@ def book():
         email = contact.get("email", data.get("email", ""))
         phone = contact.get("phone", data.get("phone", ""))
 
-        # If phone is empty or placeholder, try the store
+        # ALWAYS inject from store - override whatever Aria sent
         store = get_store()
-        if not phone or phone == "+61400000000" or len(phone) < 8:
+        if store:
             for stored_number, stored_data in store.items():
-                if not first_name:
-                    first_name = stored_data.get("firstName", "")
-                if not email:
-                    email = stored_data.get("email", "")
-                if not phone or phone == "+61400000000":
-                    phone = stored_data.get("phone", stored_number)
+                first_name = stored_data.get("firstName", "") or first_name
+                email = stored_data.get("email", "") or email
+                phone = stored_data.get("phone", stored_number)
                 logger.info(f"Injected from store: name={first_name}, email={email}, phone={phone}")
                 break
 
