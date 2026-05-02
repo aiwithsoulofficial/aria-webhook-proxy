@@ -61,7 +61,8 @@ def debug():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "aria-webhook-proxy", "contacts_cached": len(get_store())})
+    store = get_store()
+    return jsonify({"status": "ok", "service": "aria-webhook-proxy", "contacts_cached": len(store), "contacts": store})
 
 
 @app.route("/trigger-call", methods=["POST"])
