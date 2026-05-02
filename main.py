@@ -22,15 +22,37 @@ GHL_KEY = os.environ.get("GHL_KEY", "pit-987b2fbe-781e-463d-b6b2-2e9a42fe6be0")
 AGENT_ID = "agent_6001kpa99tm7fm5sk5da7h057s3r"
 AGENT_PHONE_ID = "phnum_3501kpvsp97afx0sy9d0pnzhqwnk"
 
-# In-memory store of contact details keyed by phone number
-# When GHL triggers a call, we store the contact details
-# When Aria books, we look up the details by phone number
-contact_store = {}
+# File-based store of contact details keyed by phone number
+# Survives restarts unlike in-memory dict
+STORE_PATH = "/tmp/aria-contacts.json"
+
+
+def load_store():
+    try:
+        with open(STORE_PATH, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_store(store):
+    with open(STORE_PATH, "w") as f:
+        json.dump(store, f)
+
+
+def get_store():
+    store = load_store()
+    # Clean entries older than 1 hour
+    now = time.time()
+    cleaned = {k: v for k, v in store.items() if now - v.get("stored_at", 0) < 3600}
+    if len(cleaned) != len(store):
+        save_store(cleaned)
+    return cleaned
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "aria-webhook-proxy", "contacts_cached": len(contact_store)})
+    return jsonify({"status": "ok", "service": "aria-webhook-proxy", "contacts_cached": len(get_store())})
 
 
 @app.route("/trigger-call", methods=["POST"])
@@ -69,13 +91,15 @@ def trigger_call():
             customer_phone = "+" + customer_phone
 
         # Store contact details for when Aria books
-        contact_store[to_number] = {
+        store = load_store()
+        store[to_number] = {
             "firstName": customer_name,
             "email": customer_email,
             "phone": customer_phone or to_number,
             "contact_id": contact_id,
             "stored_at": time.time()
         }
+        save_store(store)
         logger.info(f"Stored contact: {to_number} -> {customer_name} / {customer_email}")
 
         # Trigger ElevenLabs call
@@ -121,9 +145,9 @@ def book():
         phone = contact.get("phone", data.get("phone", ""))
 
         # If phone is empty or placeholder, try the store
+        store = get_store()
         if not phone or phone == "+61400000000" or len(phone) < 8:
-            # Look up by any stored number
-            for stored_number, stored_data in contact_store.items():
+            for stored_number, stored_data in store.items():
                 if not first_name:
                     first_name = stored_data.get("firstName", "")
                 if not email:
