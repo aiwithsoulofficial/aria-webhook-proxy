@@ -1,13 +1,15 @@
 """
 Aria Webhook Proxy
-Receives GHL webhook (custom data format) and forwards as JSON body to ElevenLabs outbound call API.
-Bridges the gap between GHL's custom data format and ElevenLabs' JSON body requirement.
+1. /trigger-call - Receives GHL webhook, stores contact details, triggers ElevenLabs call
+2. /book - Receives Aria's booking request, injects stored contact details, forwards to GHL
 """
 
 from flask import Flask, request, jsonify
 import requests
 import os
 import logging
+import json
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -16,94 +18,156 @@ app = Flask(__name__)
 
 ELEVEN_LABS_URL = "https://api.elevenlabs.io/v1/convai/twilio/outbound_call"
 ELEVEN_LABS_KEY = os.environ.get("XI_API_KEY", "sk_1a2a2a07d19b6f993c0b98203dd355f2938c9f855ba76d97")
+GHL_KEY = os.environ.get("GHL_KEY", "pit-987b2fbe-781e-463d-b6b2-2e9a42fe6be0")
 AGENT_ID = "agent_6001kpa99tm7fm5sk5da7h057s3r"
 AGENT_PHONE_ID = "phnum_3501kpvsp97afx0sy9d0pnzhqwnk"
+
+# In-memory store of contact details keyed by phone number
+# When GHL triggers a call, we store the contact details
+# When Aria books, we look up the details by phone number
+contact_store = {}
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "aria-webhook-proxy"})
+    return jsonify({"status": "ok", "service": "aria-webhook-proxy", "contacts_cached": len(contact_store)})
 
 
 @app.route("/trigger-call", methods=["POST"])
 def trigger_call():
-    """Receive GHL webhook and trigger ElevenLabs outbound call."""
+    """Receive GHL webhook, store contact details, trigger ElevenLabs call."""
     try:
-        # GHL sends data as JSON or form data
         data = request.json or request.form.to_dict()
-        logger.info(f"Received webhook data: {data}")
+        logger.info(f"Received webhook: {json.dumps(data)}")
 
-        # Extract contact details from GHL custom data
         to_number = (
             data.get("to_number") or
             data.get("phone") or
-            data.get("contact_phone") or
             data.get("customer_phone", "")
         )
         customer_name = (
             data.get("customer_name") or
-            data.get("contact_name") or
             data.get("first_name") or
             data.get("firstName", "")
         )
         customer_email = (
             data.get("customer_email") or
-            data.get("contact_email") or
             data.get("email", "")
         )
-        # customer_phone: use to_number as the most reliable source
-        # since that's what GHL resolves from {{contact.phone}}
-        customer_phone = to_number
+        customer_phone = (
+            data.get("customer_phone") or
+            to_number or ""
+        )
         contact_id = data.get("contact_id", "")
 
         if not to_number:
-            logger.error("No phone number provided")
-            return jsonify({"error": "No phone number provided"}), 400
+            return jsonify({"error": "No phone number"}), 400
 
-        # Ensure phone has + prefix
         if not to_number.startswith("+"):
             to_number = "+" + to_number
         if customer_phone and not customer_phone.startswith("+"):
             customer_phone = "+" + customer_phone
 
-        # Build ElevenLabs request with dynamic variables
-        # These get injected into the agent's prompt and first message
+        # Store contact details for when Aria books
+        contact_store[to_number] = {
+            "firstName": customer_name,
+            "email": customer_email,
+            "phone": customer_phone or to_number,
+            "contact_id": contact_id,
+            "stored_at": time.time()
+        }
+        logger.info(f"Stored contact: {to_number} -> {customer_name} / {customer_email}")
+
+        # Trigger ElevenLabs call
         eleven_payload = {
             "agent_id": AGENT_ID,
             "agent_phone_number_id": AGENT_PHONE_ID,
             "to_number": to_number,
-            "dynamic_variables": [
-                {"name": "customer_name", "value": customer_name or "there"},
-                {"name": "customer_email", "value": customer_email},
-                {"name": "customer_phone", "value": customer_phone},
-                {"name": "contact_id", "value": contact_id},
-            ]
         }
-
-        logger.info(f"Calling ElevenLabs: to={to_number}, name={customer_name}, email={customer_email}, phone={customer_phone}")
 
         r = requests.post(
             ELEVEN_LABS_URL,
-            headers={
-                "xi-api-key": ELEVEN_LABS_KEY,
-                "Content-Type": "application/json"
-            },
+            headers={"xi-api-key": ELEVEN_LABS_KEY, "Content-Type": "application/json"},
             json=eleven_payload,
             timeout=30
         )
+        logger.info(f"ElevenLabs: {r.status_code} - {r.text[:200]}")
 
-        logger.info(f"ElevenLabs response: {r.status_code} - {r.text[:200]}")
-
-        return jsonify({
-            "status": "call_triggered",
-            "eleven_status": r.status_code,
-            "response": r.json() if r.status_code == 200 else r.text[:200],
-            "customer_name": customer_name,
-            "to_number": to_number
-        }), 200
+        return jsonify({"status": "call_triggered", "to": to_number}), 200
 
     except Exception as e:
-        logger.exception("Error processing webhook")
+        logger.exception("Error in trigger-call")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/book", methods=["POST"])
+def book():
+    """Receive booking request from Aria, inject stored contact details, forward to GHL."""
+    try:
+        data = request.json or {}
+        logger.info(f"Booking request: {json.dumps(data)}")
+
+        # Get the selected slot and other booking details from Aria
+        calendar_id = data.get("calendarId", "Mh4aoOLuDqTBkh4aTbqC")
+        location_id = data.get("locationId", "0TWza0nu95nr1KSlTgm7")
+        selected_slot = data.get("selectedSlot", "")
+        selected_timezone = data.get("selectedTimezone", "Australia/Sydney")
+        title = data.get("title", "Venus Viva Full Face Skin Tightening")
+
+        # Get contact details - first from the request, then from the store
+        contact = data.get("contact", {})
+        first_name = contact.get("firstName", data.get("firstName", ""))
+        email = contact.get("email", data.get("email", ""))
+        phone = contact.get("phone", data.get("phone", ""))
+
+        # If phone is empty or placeholder, try the store
+        if not phone or phone == "+61400000000" or len(phone) < 8:
+            # Look up by any stored number
+            for stored_number, stored_data in contact_store.items():
+                if not first_name:
+                    first_name = stored_data.get("firstName", "")
+                if not email:
+                    email = stored_data.get("email", "")
+                if not phone or phone == "+61400000000":
+                    phone = stored_data.get("phone", stored_number)
+                logger.info(f"Injected from store: name={first_name}, email={email}, phone={phone}")
+                break
+
+        if not selected_slot:
+            return jsonify({"error": "No slot selected"}), 400
+
+        # Build GHL booking request
+        ghl_body = {
+            "calendarId": calendar_id,
+            "locationId": location_id,
+            "selectedSlot": selected_slot,
+            "selectedTimezone": selected_timezone,
+            "title": title,
+            "contact": {
+                "firstName": first_name or "Customer",
+                "email": email or "noemail@placeholder.com",
+                "phone": phone
+            }
+        }
+
+        logger.info(f"Booking to GHL: {json.dumps(ghl_body)}")
+
+        r = requests.post(
+            "https://services.leadconnectorhq.com/calendars/events/appointments",
+            headers={
+                "Authorization": f"Bearer {GHL_KEY}",
+                "Version": "2021-04-15",
+                "Content-Type": "application/json"
+            },
+            json=ghl_body,
+            timeout=30
+        )
+
+        logger.info(f"GHL response: {r.status_code} - {r.text[:300]}")
+        return r.text, r.status_code, {"Content-Type": "application/json"}
+
+    except Exception as e:
+        logger.exception("Error in book")
         return jsonify({"error": str(e)}), 500
 
 
