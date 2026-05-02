@@ -1,7 +1,7 @@
 """
 Aria Webhook Proxy
 Receives GHL webhook (custom data format) and forwards as JSON body to ElevenLabs outbound call API.
-Deploy to Render as a web service.
+Bridges the gap between GHL's custom data format and ElevenLabs' JSON body requirement.
 """
 
 from flask import Flask, request, jsonify
@@ -31,9 +31,9 @@ def trigger_call():
     try:
         # GHL sends data as JSON or form data
         data = request.json or request.form.to_dict()
-        logger.info(f"Received webhook: {data}")
+        logger.info(f"Received webhook data: {data}")
 
-        # Extract contact details - GHL sends these in various formats
+        # Extract contact details from GHL custom data
         to_number = (
             data.get("to_number") or
             data.get("phone") or
@@ -51,6 +51,11 @@ def trigger_call():
             data.get("contact_email") or
             data.get("email", "")
         )
+        customer_phone = (
+            data.get("customer_phone") or
+            data.get("phone") or
+            to_number or ""
+        )
         contact_id = data.get("contact_id", "")
 
         if not to_number:
@@ -60,27 +65,24 @@ def trigger_call():
         # Ensure phone has + prefix
         if not to_number.startswith("+"):
             to_number = "+" + to_number
+        if customer_phone and not customer_phone.startswith("+"):
+            customer_phone = "+" + customer_phone
 
-        # Build ElevenLabs request
+        # Build ElevenLabs request with dynamic variables
+        # These get injected into the agent's prompt and first message
         eleven_payload = {
             "agent_id": AGENT_ID,
             "agent_phone_number_id": AGENT_PHONE_ID,
             "to_number": to_number,
-            "conversation_config_override": {
-                "agent": {
-                    "dynamic_variables": {
-                        "dynamic_variable_placeholders": {
-                            "customer_name": customer_name or "there",
-                            "customer_email": customer_email,
-                            "customer_phone": to_number,
-                            "contact_id": contact_id
-                        }
-                    }
-                }
-            }
+            "dynamic_variables": [
+                {"name": "customer_name", "value": customer_name or "there"},
+                {"name": "customer_email", "value": customer_email},
+                {"name": "customer_phone", "value": customer_phone},
+                {"name": "contact_id", "value": contact_id},
+            ]
         }
 
-        logger.info(f"Calling ElevenLabs for {to_number} ({customer_name})")
+        logger.info(f"Calling ElevenLabs: to={to_number}, name={customer_name}, email={customer_email}, phone={customer_phone}")
 
         r = requests.post(
             ELEVEN_LABS_URL,
