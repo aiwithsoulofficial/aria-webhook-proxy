@@ -51,11 +51,9 @@ def trigger_call():
             data.get("contact_email") or
             data.get("email", "")
         )
-        customer_phone = (
-            data.get("customer_phone") or
-            data.get("phone") or
-            to_number or ""
-        )
+        # customer_phone: use to_number as the most reliable source
+        # since that's what GHL resolves from {{contact.phone}}
+        customer_phone = to_number
         contact_id = data.get("contact_id", "")
 
         if not to_number:
