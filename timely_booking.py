@@ -1,210 +1,269 @@
 """
-Timely Booking Automation via Playwright
-Creates bookings in Timely's admin calendar by automating the booking form.
-Runs headlessly on the server after Aria completes a call.
+Timely Booking Creation via pure HTTP requests.
+No Playwright/Chromium needed. Logs in, grabs anti-forgery token, POSTs form data.
 """
 
 import logging
-import asyncio
-from playwright.async_api import async_playwright
+import requests
+import re
+import time
 
 logger = logging.getLogger(__name__)
 
 TIMELY_LOGIN_URL = "https://app.gettimely.com/Account/Login"
+TIMELY_BOOKING_URL = "https://app.gettimely.com/Calendar/BookingEdit/0"
 TIMELY_CALENDAR_URL = "https://app.gettimely.com/calendar"
 
+# Service IDs from the Timely admin form
+SERVICE_IDS = {
+    "skin_consultation": "3377214:SV",
+    "hifu_full_face": "5264337:SV",
+    "hifu_face_neck": "5087881:SV",
+    "signature_peel": "3359861:SV",
+    "skinpen": "3359893:SV",
+}
 
-async def create_timely_booking(
-    email: str,
-    password: str,
-    location_id: str,
-    customer_name: str,
-    customer_phone: str,
-    customer_email: str = "",
-    staff_id: str = "486177",  # Mojgan default
-    booking_date: str = "",  # e.g. "2026-05-12"
-    booking_time: str = "",  # e.g. "10:00am"
-    service_name: str = "Injectables Consultation",
-) -> dict:
-    """Create a booking in Timely via Playwright automation.
+DEFAULT_SERVICE = "skin_consultation"
 
-    Returns dict with success status and any error message.
-    """
-    result = {"success": False, "error": None, "details": None}
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            viewport={"width": 1440, "height": 900},
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+def timely_login_session(email, password):
+    """Login to Timely and return authenticated session."""
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+    })
+
+    # GET login page for CSRF token
+    r = session.get(TIMELY_LOGIN_URL, timeout=15)
+
+    token = ""
+    match = re.search(r'name="__RequestVerificationToken"[^>]*value="([^"]+)"', r.text)
+    if match:
+        token = match.group(1)
+
+    # POST login
+    login_data = {
+        "Email": email,
+        "Password": password,
+        "RememberMe": "true",
+    }
+    if token:
+        login_data["__RequestVerificationToken"] = token
+
+    r = session.post(TIMELY_LOGIN_URL, data=login_data, allow_redirects=True, timeout=15)
+
+    if "calendar" in r.url.lower() or r.status_code == 200:
+        logger.info("[timely-book] Login successful")
+        return session
+
+    logger.error(f"[timely-book] Login failed: {r.status_code} -> {r.url}")
+    return None
+
+
+def get_booking_form_tokens(session, location_id, staff_id, date_str, time_str):
+    """Load the booking form to get anti-forgery token and hash."""
+    # Navigate to calendar with new booking mode
+    url = f"{TIMELY_CALENDAR_URL}?isNewBooking=True&locationId={location_id}&staffId={staff_id}"
+    r = session.get(url, timeout=15)
+
+    if r.status_code != 200:
+        return None, None
+
+    # The booking form is loaded via AJAX when clicking a time slot.
+    # Try loading the booking edit page directly
+    form_url = (
+        f"{TIMELY_BOOKING_URL}"
+        f"?staffId={staff_id}"
+        f"&date={date_str}"
+        f"&time={time_str}"
+        f"&locationId={location_id}"
+    )
+    r = session.get(form_url, timeout=15)
+
+    # Extract __RequestVerificationToken
+    token = ""
+    match = re.search(r'name="__RequestVerificationToken"[^>]*value="([^"]+)"', r.text)
+    if match:
+        token = match.group(1)
+
+    # Extract Hash
+    hash_val = ""
+    match = re.search(r'name="Hash"[^>]*value="([^"]+)"', r.text)
+    if match:
+        hash_val = match.group(1)
+
+    logger.info(f"[timely-book] Got token: {bool(token)}, hash: {bool(hash_val)}")
+    return token, hash_val
+
+
+def create_timely_booking_requests(
+    email,
+    password,
+    location_id,
+    customer_name,
+    customer_phone,
+    customer_email="",
+    staff_id="486177",
+    booking_date="",
+    booking_time="",
+    service_key="skin_consultation",
+):
+    """Create a booking in Timely using pure HTTP requests."""
+    result = {"success": False, "error": None}
+
+    try:
+        # Step 1: Login
+        session = timely_login_session(email, password)
+        if not session:
+            result["error"] = "Login failed"
+            return result
+
+        # Step 2: Get form tokens
+        # Format date for Timely: DD/MM/YYYY
+        date_parts = booking_date.split("-")  # YYYY-MM-DD
+        if len(date_parts) == 3:
+            timely_date = f"{date_parts[2]}/{date_parts[1]}/{date_parts[0]}"
+            start_date = f"{date_parts[2]}/{date_parts[1]}/{date_parts[0]} {booking_time}:00"
+        else:
+            timely_date = booking_date
+            start_date = f"{booking_date} {booking_time}:00"
+
+        token, hash_val = get_booking_form_tokens(
+            session, location_id, staff_id, timely_date, booking_time
         )
-        page = await context.new_page()
 
-        try:
-            # Step 1: Login
-            logger.info(f"[timely-book] Logging in...")
-            await page.goto(TIMELY_LOGIN_URL, wait_until="networkidle")
-            await page.fill("#Email", email)
-            await page.fill("#Password", password)
-            await page.click('button[type="submit"]')
-            await page.wait_for_timeout(5000)
+        if not token:
+            # Try without the form page - just use the token from login
+            logger.warning("[timely-book] No form token, trying with session token")
 
-            if "calendar" not in page.url.lower():
-                result["error"] = f"Login failed, landed on {page.url}"
-                return result
+        # Step 3: Build form data
+        service_id = SERVICE_IDS.get(service_key, SERVICE_IDS[DEFAULT_SERVICE])
 
-            logger.info(f"[timely-book] Logged in, opening new booking form...")
+        # Convert time format: "10:00am" stays as is
+        time_formatted = booking_time.lower().replace(" ", "")
 
-            # Step 2: Open new booking form at the right date
-            new_booking_url = (
-                f"{TIMELY_CALENDAR_URL}?isNewBooking=True"
-                f"&locationId={location_id}&staffId={staff_id}"
-            )
-            await page.goto(new_booking_url, wait_until="networkidle")
-            await page.wait_for_timeout(3000)
+        form_data = {
+            "__RequestVerificationToken": token,
+            "Booking.BookingGroupId": "0",
+            "Booking.CustomerId": "0",
+            "Booking.Customer.TimeZoneLocaleId": "",
+            "Tab": "details",
+            "IsInvoiced": "False",
+            "UpdateThisOnly": "False",
+            "HideUpdateDateButton": "False",
+            "CalendarEntryDateTimeModel.StartDate": start_date,
+            "ConcessionItemDto": "",
+            "IsRebook": "False",
+            "ShouldRaiseSale": "False",
+            "ShouldSaveAndAddDeposit": "False",
+            "Hash": hash_val or "",
+            "WaitlistId": "",
+            "BusinessCancellationFeeType": "0",
+            "CanChargeCancellationFee": "False",
+            "ChangesPolicy": "",
+            "CancellationFeePerServicePopover": "",
+            "CurrencySymbol": "$",
+            "UseNewFlow": "False",
+            "CancellationFeeAmount": "",
+            "Booking.LocationId": location_id,
+            "CustomerName": customer_name,
+            "Booking.Customer.CustomerTypeId": "1",  # New customer
+            "Booking.Customer.Contact.SmsNumber": customer_phone,
+            "Booking.Customer.Contact.Telephone": "",
+            "Booking.Customer.Contact.Email": customer_email,
+            "Booking.Customer.AllowSmsMarketing": "false",
+            "Bookings[0].Active": "True",
+            "Bookings[0].PaddingStart": "00:00",
+            "Bookings[0].PaddingEnd": "00:00",
+            "Bookings[0].ServiceId": service_id,
+            "Bookings[0].ServiceName": "",
+            "Bookings[0].IsServiceGroup": "False",
+            "Bookings[0].ServiceGroupId": "0",
+            "Bookings[0].IsPartOfServiceGroup": "False",
+            "Bookings[0].ServiceGroupItemId": "0",
+            "Bookings[0].ProcessingTime": "00:00",
+            "Bookings[0].PostTimeDurationTypeId": "1",
+            "Bookings[0].BookingLinkEnabled": "False",
+            "Bookings[0].CustomerConcessionId": "",
+            "Bookings[0].CustomerPackageId": "",
+            "Bookings[0].HasOverridePrice": "False",
+            "Bookings[0].StaffId": staff_id,
+            "Bookings[0].IsStaffRequested": "false",
+            "Bookings[0].ResourceId": "-1",
+            "Bookings[0].Time": time_formatted,
+            "Bookings[0].Length": "00:20",  # 20 min consultation
+            "Bookings[0].Price": "",
+            "Bookings[1].Active": "False",
+            "Bookings[1].PaddingStart": "00:00",
+            "Bookings[1].PaddingEnd": "00:00",
+            "Bookings[1].ServiceId": "0",
+            "Bookings[1].ServiceName": "",
+            "Bookings[1].IsServiceGroup": "False",
+            "Bookings[1].ServiceGroupId": "0",
+            "Bookings[1].IsPartOfServiceGroup": "False",
+            "Bookings[1].ServiceGroupItemId": "0",
+            "Bookings[1].ProcessingTime": "00:00",
+            "Bookings[1].PostTimeDurationTypeId": "1",
+            "Bookings[1].BookingLinkEnabled": "False",
+            "Bookings[1].CustomerConcessionId": "",
+            "Bookings[1].CustomerPackageId": "",
+            "Bookings[1].HasOverridePrice": "False",
+            "Bookings[1].StaffId": staff_id,
+            "Bookings[1].IsStaffRequested": "false",
+            "Bookings[1].ResourceId": "-1",
+            "Bookings[1].Time": "",
+            "Bookings[1].Length": "00:00",
+            "Bookings[1].Price": "",
+            "Booking.BookingStatusId": "2",  # Confirmed
+            "Booking.BookingConfirmationStatusId": "1",  # Not started
+            "AutoExpirePencilledInBooking": "false",
+            "CalendarRecurrenceModel.CalendarRecurrence.RecurrenceTypeId": "-1",
+            "CalendarRecurrenceModel.CalendarRecurrence.Interval": "1",
+            "CalendarRecurrenceModel.CalendarRecurrence.RepeatTypeId": "2",
+            "CalendarRecurrenceModel.CalendarRecurrence.Occurrences": "1",
+            "NoteModel.Note.NoteText": "Booked by Aria AI voice agent",
+            "NoteModel.Note.DateCreated": "01/01/0001 00:00:00",
+            "LocationContactAddressRequired": "False",
+        }
 
-            # Step 3: If we need a specific date, navigate to it
-            if booking_date:
-                # Navigate forward/back to the right date using the calendar nav
-                # For now, click on the date in the calendar header
-                # The date picker pen icon lets us jump to a date
-                try:
-                    pen_icon = page.locator('text=Fri, May').first
-                    # Just navigate via URL param
-                    dated_url = (
-                        f"{TIMELY_CALENDAR_URL}?isNewBooking=True"
-                        f"&locationId={location_id}&staffId={staff_id}"
-                        f"&date={booking_date}"
-                    )
-                    await page.goto(dated_url, wait_until="networkidle")
-                    await page.wait_for_timeout(3000)
-                except Exception:
-                    pass
+        # Step 4: POST the form
+        logger.info(f"[timely-book] POSTing booking: {customer_name} on {booking_date} at {booking_time}")
 
-            # Step 4: Click on the time slot for the target staff member
-            # The calendar shows "Choose a time for the new appointment"
-            # Click at the correct time position on the correct staff column
-            logger.info(f"[timely-book] Clicking time slot {booking_time}...")
+        r = session.post(
+            TIMELY_BOOKING_URL,
+            data=form_data,
+            allow_redirects=True,
+            timeout=30,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": f"{TIMELY_CALENDAR_URL}?isNewBooking=True&locationId={location_id}",
+                "Origin": "https://app.gettimely.com",
+            }
+        )
 
-            # Click on the staff column at the target time
-            # We'll use coordinate-based clicking based on the time
-            # Parse the time to calculate Y position
-            clicked = False
-            try:
-                # Try clicking by matching the time label in the grid
-                time_label = booking_time.replace(" ", "")  # "10:00am"
-                # The grid has time labels on the left - find the row
-                time_cell = page.locator(f'text="{time_label}"').first
-                if await time_cell.is_visible():
-                    box = await time_cell.bounding_box()
-                    if box:
-                        # Click to the right of the time label (in the staff column)
-                        # Staff column 1 (Mojgan) is roughly x=350
-                        await page.mouse.click(350, box["y"] + 10)
-                        clicked = True
-                        await page.wait_for_timeout(3000)
-            except Exception as e:
-                logger.warning(f"[timely-book] Time label click failed: {e}")
+        logger.info(f"[timely-book] POST response: {r.status_code}, URL: {r.url}")
 
-            if not clicked:
-                # Fallback: use coordinate-based approach
-                # Parse time to get approximate Y position
-                # Calendar starts at ~9am, each 30min is ~30px
-                time_str = booking_time.lower().replace(" ", "")
-                hour = int(time_str.split(":")[0])
-                minute_part = time_str.split(":")[1]
-                minutes = int("".join(c for c in minute_part if c.isdigit()))
-                if "pm" in time_str and hour != 12:
-                    hour += 12
-
-                # Approximate Y: header ~130px, each hour ~60px from 9am
-                y_offset = 160 + (hour - 9) * 60 + (minutes / 60) * 60
-                await page.mouse.click(350, y_offset)
-                await page.wait_for_timeout(3000)
-
-            # Step 5: Check if the booking form opened
-            add_appt = page.locator('text="Add appointment"')
-            if not await add_appt.is_visible(timeout=5000):
-                result["error"] = "Booking form did not open after clicking time slot"
-                return result
-
-            logger.info(f"[timely-book] Booking form open, filling details...")
-
-            # Step 6: Fill customer details
-            name_field = page.locator('input[placeholder="First and last name"]')
-            await name_field.fill(customer_name)
-            await page.wait_for_timeout(500)
-
-            mobile_field = page.locator('input[placeholder="Mobile"]')
-            await mobile_field.fill(customer_phone)
-            await page.wait_for_timeout(500)
-
-            if customer_email:
-                email_field = page.locator('input[placeholder="Email"]')
-                await email_field.fill(customer_email)
-                await page.wait_for_timeout(500)
-
-            # Step 7: Select service (the dropdown is a custom select)
-            # The service dropdown has id "Bookings_0__ServiceId"
-            try:
-                service_select = page.locator("#Bookings_0__ServiceId")
-                await service_select.select_option(label=service_name)
-                await page.wait_for_timeout(1000)
-            except Exception as e:
-                logger.warning(f"[timely-book] Service selection failed: {e}")
-                # Try partial match
-                try:
-                    options = await service_select.locator("option").all_text_contents()
-                    for opt in options:
-                        if service_name.lower() in opt.lower():
-                            await service_select.select_option(label=opt)
-                            break
-                except Exception:
-                    pass
-
-            # Step 8: Set status to Confirmed
-            try:
-                confirmed_btn = page.locator('text="Confirmed"')
-                await confirmed_btn.click()
-                await page.wait_for_timeout(500)
-            except Exception:
-                pass
-
-            # Step 9: Intercept the Save POST
-            logger.info(f"[timely-book] Clicking Save...")
-
-            async with page.expect_response(
-                lambda r: "gettimely.com" in r.url and r.request.method == "POST",
-                timeout=15000
-            ) as response_info:
-                save_btn = page.locator('button:text("Save"), input:text("Save"), .btn-primary:text("Save")')
-                await save_btn.click()
-
-            response = await response_info.value
-            logger.info(f"[timely-book] Save response: {response.status} {response.url}")
-
-            if response.status in (200, 201, 302):
+        # Check for success - successful booking redirects to calendar
+        if r.status_code in (200, 302) and ("calendar" in r.url.lower() or "bookingedit" in r.url.lower()):
+            # Check if the response contains error messages
+            if "error" in r.text.lower() and "validation" in r.text.lower():
+                errors = re.findall(r'<span class="field-validation-error[^"]*">([^<]+)</span>', r.text)
+                result["error"] = f"Validation errors: {errors}"
+            else:
                 result["success"] = True
                 result["details"] = {
                     "customer": customer_name,
                     "phone": customer_phone,
                     "time": f"{booking_date} {booking_time}",
-                    "service": service_name,
+                    "service": service_key,
+                    "response_url": r.url,
                 }
                 logger.info(f"[timely-book] Booking created successfully!")
-            else:
-                result["error"] = f"Save returned status {response.status}"
+        else:
+            result["error"] = f"Unexpected response: {r.status_code} -> {r.url}"
 
-        except Exception as e:
-            logger.exception(f"[timely-book] Error creating booking")
-            result["error"] = str(e)
-
-        finally:
-            await browser.close()
+    except Exception as e:
+        logger.exception("[timely-book] Error creating booking")
+        result["error"] = str(e)
 
     return result
-
-
-def create_booking_sync(**kwargs) -> dict:
-    """Synchronous wrapper for the async booking function."""
-    return asyncio.run(create_timely_booking(**kwargs))

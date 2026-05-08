@@ -526,8 +526,8 @@ def book(clinic_slug=None):
 
                 def run_timely_booking():
                     try:
-                        from timely_booking import create_booking_sync
-                        result = create_booking_sync(
+                        from timely_booking import create_timely_booking_requests
+                        result = create_timely_booking_requests(
                             email=cfg["email"],
                             password=cfg["password"],
                             location_id=cfg["location_id"],
@@ -537,7 +537,7 @@ def book(clinic_slug=None):
                             staff_id=staff_id,
                             booking_date=booking_date,
                             booking_time=booking_time,
-                            service_name="Injectables Consultation",
+                            service_key="skin_consultation",
                         )
                         logger.info(f"[confiderm] Timely booking result: {result}")
                     except Exception as e:
