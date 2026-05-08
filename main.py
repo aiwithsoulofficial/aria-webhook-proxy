@@ -1,8 +1,9 @@
 """
-Aria Webhook Proxy - Multi-Tenant
+Aria Webhook Proxy - Multi-Tenant with Timely Integration
 1. /trigger-call/<clinic> - Receives GHL webhook, stores contact details, triggers ElevenLabs call
 2. /book/<clinic> - Receives Aria's booking request, injects stored contact details, forwards to GHL
-3. /trigger-call and /book (no clinic) - backwards-compatible, uses Lumiere defaults
+3. /timely/availability - Check real Timely availability for Confiderm
+4. /trigger-call and /book (no clinic) - backwards-compatible, uses Lumiere defaults
 """
 
 from flask import Flask, request, jsonify
@@ -11,6 +12,8 @@ import os
 import logging
 import json
 import time
+from datetime import datetime, timedelta
+from threading import Lock
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,7 +24,6 @@ ELEVEN_LABS_URL = "https://api.elevenlabs.io/v1/convai/twilio/outbound_call"
 ELEVEN_LABS_KEY = os.environ.get("XI_API_KEY", "sk_1a2a2a07d19b6f993c0b98203dd355f2938c9f855ba76d97")
 
 # Multi-tenant clinic configurations
-# Each clinic has its own agent, phone, calendar, location, and GHL key
 CLINICS = {
     "lumiere": {
         "name": "Lumiere Skin and Body",
@@ -31,7 +33,8 @@ CLINICS = {
         "calendar_id": "Mh4aoOLuDqTBkh4aTbqC",
         "location_id": "0TWza0nu95nr1KSlTgm7",
         "timezone": "Australia/Sydney",
-        "default_title": "Venus Viva Full Face Skin Tightening"
+        "default_title": "Venus Viva Full Face Skin Tightening",
+        "booking_system": "ghl"
     },
     "confiderm": {
         "name": "Confiderm Skin Care",
@@ -41,19 +44,219 @@ CLINICS = {
         "calendar_id": "H9z1MTWykO17vGy1q5rn",
         "location_id": "ADOTS56fHDDghWSBIcOz",
         "timezone": "Australia/Brisbane",
-        "default_title": "Confiderm Skin Consultation"
+        "default_title": "Confiderm Skin Consultation",
+        "booking_system": "timely",
+        "timely": {
+            "email": os.environ.get("TIMELY_EMAIL", "moj_b52@yahoo.com"),
+            "password": os.environ.get("TIMELY_PASSWORD", "Ariasorush12?"),
+            "location_id": "275601",
+            "staff": {
+                "486177": "Mojgan Broumand",
+                "514556": "Dr. Yousef Khammar"
+            },
+            "open_hours": {
+                "0": {"open": "09:00", "close": "16:00"},  # Sunday
+                "1": {"open": "09:00", "close": "19:00"},  # Monday
+                "2": {"open": "09:00", "close": "19:00"},  # Tuesday
+                "3": {"open": "09:00", "close": "19:00"},  # Wednesday
+                "4": {"open": "09:00", "close": "19:00"},  # Thursday
+                "5": {"open": "09:00", "close": "19:00"},  # Friday
+                "6": {"open": "09:00", "close": "16:00"},  # Saturday
+            },
+            "slot_duration_mins": 30,
+            "mojgan_phone": "+61488874342"
+        }
     }
 }
 
-# Default clinic for backwards compatibility (no slug in URL)
 DEFAULT_CLINIC = "lumiere"
-
-# Lookup agent_id -> clinic for /book endpoint (Aria sends agent context)
 AGENT_TO_CLINIC = {cfg["agent_id"]: slug for slug, cfg in CLINICS.items()}
-
-# File-based store of contact details keyed by phone number
 STORE_PATH = "/tmp/aria-contacts.json"
 
+# ── Timely session management ──────────────────────────────────────
+
+TIMELY_SESSION_PATH = "/tmp/timely-session.json"
+timely_lock = Lock()
+
+
+def timely_login():
+    """Login to Timely admin and store session cookies."""
+    cfg = CLINICS["confiderm"]["timely"]
+    session = http_requests.Session()
+
+    # GET login page for CSRF token
+    login_page = session.get("https://app.gettimely.com/Account/Login", timeout=15)
+
+    # Extract __RequestVerificationToken from the page
+    token = ""
+    for line in login_page.text.split("\n"):
+        if "__RequestVerificationToken" in line and 'value="' in line:
+            token = line.split('value="')[1].split('"')[0]
+            break
+
+    # POST login
+    login_data = {
+        "EmailAddress": cfg["email"],
+        "Password": cfg["password"],
+        "RememberMe": "true",
+    }
+    if token:
+        login_data["__RequestVerificationToken"] = token
+
+    r = session.post(
+        "https://app.gettimely.com/Account/Login",
+        data=login_data,
+        allow_redirects=True,
+        timeout=15
+    )
+
+    if "calendar" in r.url.lower() or r.status_code == 200:
+        # Save cookies
+        cookies = dict(session.cookies)
+        with open(TIMELY_SESSION_PATH, "w") as f:
+            json.dump({"cookies": cookies, "logged_in_at": time.time()}, f)
+        logger.info(f"[timely] Login successful, {len(cookies)} cookies saved")
+        return session
+    else:
+        logger.error(f"[timely] Login failed: {r.status_code} -> {r.url}")
+        return None
+
+
+def get_timely_session():
+    """Get an authenticated Timely session, re-login if needed."""
+    with timely_lock:
+        session = http_requests.Session()
+
+        # Try loading existing session
+        try:
+            with open(TIMELY_SESSION_PATH, "r") as f:
+                data = json.load(f)
+                cookies = data.get("cookies", {})
+                age = time.time() - data.get("logged_in_at", 0)
+
+                # Re-login if session is older than 30 minutes
+                if age > 1800:
+                    logger.info("[timely] Session expired, re-logging in")
+                    return timely_login()
+
+                for k, v in cookies.items():
+                    session.cookies.set(k, v)
+
+                # Verify session is still valid
+                r = session.get(
+                    "https://app.gettimely.com/NotificationData/GetNotificationStats",
+                    timeout=10
+                )
+                if r.status_code == 200:
+                    return session
+                else:
+                    logger.info("[timely] Session invalid, re-logging in")
+                    return timely_login()
+
+        except (FileNotFoundError, json.JSONDecodeError):
+            return timely_login()
+
+
+def get_timely_bookings(session, start_date, end_date, location_id="275601"):
+    """Fetch existing bookings from Timely CalendarData endpoint."""
+    url = (
+        f"https://app.gettimely.com/CalendarData/CalendarData"
+        f"?locationId={location_id}&staffId=false&isMobile=false"
+        f"&view=resourceDay&start={start_date}&end={end_date}"
+        f"&_={int(time.time() * 1000)}"
+    )
+    r = session.get(url, timeout=15)
+    if r.status_code == 200:
+        return r.json()
+    logger.error(f"[timely] CalendarData failed: {r.status_code}")
+    return []
+
+
+def calculate_free_slots(bookings, open_hours, start_date_str, end_date_str, slot_mins=30):
+    """Calculate free slots by subtracting bookings from open hours."""
+    result = {}
+    start_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
+    current = start_dt
+
+    # Build a lookup of booked time ranges per day
+    booked_ranges = {}
+    for booking in bookings:
+        if booking.get("type") != 1:  # type 1 = booking
+            continue
+        b_start = booking.get("start", "")
+        b_end = booking.get("end", "")
+        if not b_start or not b_end:
+            continue
+        try:
+            bs = datetime.fromisoformat(b_start.replace(".0000000", ""))
+            be = datetime.fromisoformat(b_end.replace(".0000000", ""))
+            day_key = bs.strftime("%Y-%m-%d")
+            if day_key not in booked_ranges:
+                booked_ranges[day_key] = []
+            booked_ranges[day_key].append((bs, be))
+        except (ValueError, TypeError):
+            continue
+
+    while current < end_dt:
+        day_key = current.strftime("%Y-%m-%d")
+        dow = str(current.weekday())  # 0=Monday in Python
+        # Convert to JS-style (0=Sunday)
+        js_dow = str((current.weekday() + 1) % 7)
+
+        hours = open_hours.get(js_dow)
+        if not hours:
+            current += timedelta(days=1)
+            continue
+
+        open_time = datetime.strptime(f"{day_key} {hours['open']}", "%Y-%m-%d %H:%M")
+        close_time = datetime.strptime(f"{day_key} {hours['close']}", "%Y-%m-%d %H:%M")
+
+        # Skip if the day is in the past
+        now = datetime.now()
+        if current.date() < now.date():
+            current += timedelta(days=1)
+            continue
+        if current.date() == now.date():
+            # Start from next available slot after now + 2 hours buffer
+            earliest = now + timedelta(hours=2)
+            if earliest > open_time:
+                # Round up to next slot
+                mins = earliest.minute
+                rounded = earliest.replace(minute=0, second=0) + timedelta(
+                    minutes=((mins // slot_mins) + 1) * slot_mins
+                )
+                open_time = rounded
+
+        # Generate all possible slots
+        day_booked = booked_ranges.get(day_key, [])
+        slots = []
+        slot_start = open_time
+
+        while slot_start + timedelta(minutes=slot_mins) <= close_time:
+            slot_end = slot_start + timedelta(minutes=slot_mins)
+
+            # Check if this slot overlaps with any booking
+            is_booked = False
+            for bs, be in day_booked:
+                if slot_start < be and slot_end > bs:
+                    is_booked = True
+                    break
+
+            if not is_booked:
+                slots.append(slot_start.strftime("%Y-%m-%dT%H:%M:%S+10:00"))
+
+            slot_start = slot_end
+
+        if slots:
+            result[day_key] = {"slots": slots}
+
+        current += timedelta(days=1)
+
+    return result
+
+
+# ── Contact store ──────────────────────────────────────────────────
 
 def load_store():
     try:
@@ -78,10 +281,11 @@ def get_store():
 
 
 def get_clinic(clinic_slug=None):
-    """Get clinic config by slug, with fallback to default."""
     slug = (clinic_slug or DEFAULT_CLINIC).lower()
     return CLINICS.get(slug), slug
 
+
+# ── Routes ─────────────────────────────────────────────────────────
 
 @app.route("/debug", methods=["GET", "POST", "PUT", "PATCH"])
 def debug():
@@ -97,11 +301,64 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "aria-webhook-proxy",
-        "version": "2.0-multitenant",
+        "version": "3.0-timely",
         "clinics": list(CLINICS.keys()),
         "contacts_cached": len(store),
         "contacts": store
     })
+
+
+@app.route("/timely/availability", methods=["GET"])
+def timely_availability():
+    """Check real Timely availability for Confiderm.
+    Returns free slots in GHL-compatible format so ElevenLabs tools work unchanged.
+    Query params: startDate (epoch ms), endDate (epoch ms), timezone
+    """
+    try:
+        start_ms = request.args.get("startDate", "")
+        end_ms = request.args.get("endDate", "")
+        timezone = request.args.get("timezone", "Australia/Brisbane")
+
+        if not start_ms or not end_ms:
+            return jsonify({"error": "startDate and endDate required (epoch ms)"}), 400
+
+        # Convert epoch ms to date strings
+        start_dt = datetime.fromtimestamp(int(start_ms) / 1000)
+        end_dt = datetime.fromtimestamp(int(end_ms) / 1000)
+        start_str = start_dt.strftime("%Y-%m-%d")
+        # Timely uses exclusive end date format: Y-M-D
+        end_str = end_dt.strftime("%Y-%m-%d")
+        # Timely date format for API: Y-M-D (no leading zeros)
+        timely_start = f"{start_dt.year}-{start_dt.month}-{start_dt.day}"
+        timely_end = f"{end_dt.year}-{end_dt.month}-{end_dt.day}"
+
+        logger.info(f"[timely] Checking availability {start_str} to {end_str}")
+
+        # Get Timely session
+        session = get_timely_session()
+        if not session:
+            return jsonify({"error": "Could not login to Timely"}), 500
+
+        # Fetch existing bookings
+        cfg = CLINICS["confiderm"]["timely"]
+        bookings = get_timely_bookings(session, timely_start, timely_end, cfg["location_id"])
+        logger.info(f"[timely] Found {len(bookings)} existing bookings")
+
+        # Calculate free slots
+        free_slots = calculate_free_slots(
+            bookings,
+            cfg["open_hours"],
+            start_str,
+            end_str,
+            cfg["slot_duration_mins"]
+        )
+
+        logger.info(f"[timely] Returning {sum(len(d['slots']) for d in free_slots.values())} free slots across {len(free_slots)} days")
+        return jsonify(free_slots)
+
+    except Exception as e:
+        logger.exception("[timely] Error checking availability")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/trigger-call", methods=["POST"])
@@ -150,7 +407,6 @@ def trigger_call(clinic_slug=None):
         if customer_phone and not customer_phone.startswith("+"):
             customer_phone = "+" + customer_phone
 
-        # Store contact details with clinic context
         store = load_store()
         store[to_number] = {
             "firstName": customer_name,
@@ -163,7 +419,6 @@ def trigger_call(clinic_slug=None):
         save_store(store)
         logger.info(f"[{slug}] Stored contact: {to_number} -> {customer_name} / {customer_email}")
 
-        # Trigger ElevenLabs call with clinic-specific agent
         eleven_payload = {
             "agent_id": clinic["agent_id"],
             "agent_phone_number_id": clinic["agent_phone_id"],
@@ -188,34 +443,31 @@ def trigger_call(clinic_slug=None):
 @app.route("/book", methods=["POST"])
 @app.route("/book/<clinic_slug>", methods=["POST"])
 def book(clinic_slug=None):
-    """Receive booking request from Aria, inject stored contact details, forward to GHL."""
+    """Receive booking request from Aria, inject stored contact details, forward to GHL.
+    For Confiderm: also sends SMS notification to Mojgan to add booking in Timely."""
     try:
         data = request.json or {}
         logger.info(f"Booking request: {json.dumps(data)}")
 
-        # Determine clinic from URL slug, or from stored contact, or default
         clinic, slug = get_clinic(clinic_slug)
         if not clinic:
             return jsonify({"error": f"Unknown clinic: {clinic_slug}"}), 404
 
-        # Use clinic-specific defaults, allow override from request
         calendar_id = data.get("calendarId", clinic["calendar_id"])
         location_id = data.get("locationId", clinic["location_id"])
         selected_slot = data.get("selectedSlot", "")
         selected_timezone = data.get("selectedTimezone", clinic["timezone"])
         title = data.get("title", clinic["default_title"])
 
-        # Get contact details - first from the request, then from the store
         contact = data.get("contact", {})
         first_name = contact.get("firstName", data.get("firstName", ""))
         email = contact.get("email", data.get("email", ""))
         phone = contact.get("phone", data.get("phone", ""))
 
-        # ALWAYS inject from store - override whatever Aria sent
+        # ALWAYS inject from store
         store = get_store()
         if store:
             for stored_number, stored_data in store.items():
-                # If we have multiple contacts, prefer the one for this clinic
                 if stored_data.get("clinic") == slug or len(store) == 1:
                     first_name = stored_data.get("firstName", "") or first_name
                     email = stored_data.get("email", "") or email
@@ -226,7 +478,7 @@ def book(clinic_slug=None):
         if not selected_slot:
             return jsonify({"error": "No slot selected"}), 400
 
-        # Build GHL booking request
+        # Book in GHL (record keeping)
         ghl_body = {
             "calendarId": calendar_id,
             "locationId": location_id,
@@ -254,6 +506,35 @@ def book(clinic_slug=None):
         )
 
         logger.info(f"[{slug}] GHL response: {r.status_code} - {r.text[:300]}")
+
+        # For Confiderm: send SMS to Mojgan about the new booking
+        if slug == "confiderm" and r.status_code in (200, 201):
+            try:
+                # Format the slot time nicely
+                slot_time = selected_slot[:16].replace("T", " at ")
+                sms_body = (
+                    f"Aria booked: {first_name or 'Customer'} for {slot_time}. "
+                    f"Phone: {phone}. Please add to Timely."
+                )
+                # Send SMS via GHL
+                http_requests.post(
+                    "https://services.leadconnectorhq.com/conversations/messages",
+                    headers={
+                        "Authorization": f"Bearer {clinic['ghl_key']}",
+                        "Version": "2021-04-15",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "type": "SMS",
+                        "message": sms_body,
+                        "contactId": "internal_notification"
+                    },
+                    timeout=10
+                )
+                logger.info(f"[confiderm] SMS notification sent to Mojgan: {sms_body}")
+            except Exception as sms_err:
+                logger.warning(f"[confiderm] SMS notification failed: {sms_err}")
+
         return r.text, r.status_code, {"Content-Type": "application/json"}
 
     except Exception as e:
