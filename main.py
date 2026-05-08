@@ -13,7 +13,7 @@ import logging
 import json
 import time
 from datetime import datetime, timedelta
-from threading import Lock
+from threading import Lock, Thread
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -539,6 +539,99 @@ def book(clinic_slug=None):
 
     except Exception as e:
         logger.exception(f"Error in book ({clinic_slug})")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/postcall/confiderm", methods=["POST"])
+def postcall_confiderm():
+    """Receive ElevenLabs post-call webhook. Extract booking details and
+    create the booking in Timely via Playwright (async in background thread)."""
+    try:
+        data = request.json or {}
+        logger.info(f"[confiderm] Post-call webhook received")
+        logger.info(f"[confiderm] Data keys: {list(data.keys())}")
+
+        # Extract booking data from ElevenLabs webhook
+        # Data collection fields we configured: appointment_date_time, practitioner_booked_with, skin_concern
+        collected = data.get("data_collection", data.get("analysis", {}).get("data_collection", {}))
+        transcript = data.get("transcript", [])
+
+        appointment_time = collected.get("appointment_date_time", "")
+        practitioner = collected.get("practitioner_booked_with", "Mojgan Broumand")
+
+        # Get contact details from store (stored when call was triggered)
+        store = get_store()
+        customer_name = ""
+        customer_phone = ""
+        customer_email = ""
+        for number, contact in store.items():
+            if contact.get("clinic") == "confiderm":
+                customer_name = contact.get("firstName", "")
+                customer_phone = contact.get("phone", number)
+                customer_email = contact.get("email", "")
+                break
+
+        if not appointment_time:
+            logger.warning("[confiderm] No appointment_date_time in webhook data")
+            return jsonify({"status": "no_booking_needed", "reason": "no appointment time collected"}), 200
+
+        # Parse the appointment time
+        # Could be ISO format "2026-05-12T10:00:00+10:00" or natural "May 12 at 10am"
+        booking_date = ""
+        booking_time = ""
+        try:
+            if "T" in appointment_time:
+                dt = datetime.fromisoformat(appointment_time.replace("+10:00", "").replace("+11:00", ""))
+                booking_date = dt.strftime("%Y-%m-%d")
+                booking_time = dt.strftime("%-I:%M%p").lower()
+            else:
+                # Best effort parse
+                booking_date = appointment_time
+                booking_time = ""
+        except (ValueError, TypeError) as e:
+            logger.warning(f"[confiderm] Could not parse appointment time '{appointment_time}': {e}")
+
+        # Map practitioner to staff ID
+        staff_id = "486177"  # Mojgan default
+        if practitioner and "Khammar" in practitioner:
+            staff_id = "514556"
+
+        cfg = CLINICS["confiderm"]["timely"]
+
+        logger.info(f"[confiderm] Creating Timely booking: {customer_name} on {booking_date} at {booking_time} with staff {staff_id}")
+
+        # Run Playwright booking in background thread (don't block the webhook response)
+        def run_booking():
+            try:
+                from timely_booking import create_booking_sync
+                result = create_booking_sync(
+                    email=cfg["email"],
+                    password=cfg["password"],
+                    location_id=cfg["location_id"],
+                    customer_name=customer_name or "Customer",
+                    customer_phone=customer_phone,
+                    customer_email=customer_email,
+                    staff_id=staff_id,
+                    booking_date=booking_date,
+                    booking_time=booking_time,
+                    service_name="Injectables Consultation",
+                )
+                logger.info(f"[confiderm] Timely booking result: {result}")
+            except Exception as e:
+                logger.exception(f"[confiderm] Timely booking failed: {e}")
+
+        thread = Thread(target=run_booking)
+        thread.start()
+
+        return jsonify({
+            "status": "booking_queued",
+            "customer": customer_name,
+            "time": f"{booking_date} {booking_time}",
+            "staff": practitioner
+        }), 200
+
+    except Exception as e:
+        logger.exception("[confiderm] Error in postcall webhook")
         return jsonify({"error": str(e)}), 500
 
 
