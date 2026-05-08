@@ -308,56 +308,58 @@ def health():
     })
 
 
+SUPABASE_URL = "https://jiquevvzrdavgqonvvug.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImppcXVldnZ6cmRhdmdxb252dnVnIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTcyNzgzNTI3OCwiZXhwIjoyMDQzNDExMjc4fQ.SPhGPkjCbMPFGMYclMmTEcBQfOFPfEjVxZ3BBRY7-Gg"
+
+
 @app.route("/timely/availability", methods=["GET"])
 def timely_availability():
-    """Check real Timely availability for Confiderm.
-    Returns free slots in GHL-compatible format so ElevenLabs tools work unchanged.
-    Query params: startDate (epoch ms), endDate (epoch ms), timezone
+    """Read cached Timely availability from Supabase.
+    The local bridge syncs real Timely data every 5 minutes.
+    Returns free slots in GHL-compatible format.
     """
     try:
         start_ms = request.args.get("startDate", "")
         end_ms = request.args.get("endDate", "")
-        timezone = request.args.get("timezone", "Australia/Brisbane")
 
         if not start_ms or not end_ms:
             return jsonify({"error": "startDate and endDate required (epoch ms)"}), 400
 
-        # Convert epoch ms to date strings
         start_dt = datetime.fromtimestamp(int(start_ms) / 1000)
         end_dt = datetime.fromtimestamp(int(end_ms) / 1000)
         start_str = start_dt.strftime("%Y-%m-%d")
-        # Timely uses exclusive end date format: Y-M-D
         end_str = end_dt.strftime("%Y-%m-%d")
-        # Timely date format for API: Y-M-D (no leading zeros)
-        timely_start = f"{start_dt.year}-{start_dt.month}-{start_dt.day}"
-        timely_end = f"{end_dt.year}-{end_dt.month}-{end_dt.day}"
 
-        logger.info(f"[timely] Checking availability {start_str} to {end_str}")
+        logger.info(f"[timely] Reading cached availability {start_str} to {end_str}")
 
-        # Get Timely session
-        session = get_timely_session()
-        if not session:
-            return jsonify({"error": "Could not login to Timely"}), 500
-
-        # Fetch existing bookings
-        cfg = CLINICS["confiderm"]["timely"]
-        bookings = get_timely_bookings(session, timely_start, timely_end, cfg["location_id"])
-        logger.info(f"[timely] Found {len(bookings)} existing bookings")
-
-        # Calculate free slots
-        free_slots = calculate_free_slots(
-            bookings,
-            cfg["open_hours"],
-            start_str,
-            end_str,
-            cfg["slot_duration_mins"]
+        # Read from Supabase cache
+        r = http_requests.get(
+            f"{SUPABASE_URL}/rest/v1/aria_availability_cache"
+            f"?clinic_slug=eq.confiderm&date=gte.{start_str}&date=lte.{end_str}&order=date.asc",
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+            },
+            timeout=10
         )
 
-        logger.info(f"[timely] Returning {sum(len(d['slots']) for d in free_slots.values())} free slots across {len(free_slots)} days")
-        return jsonify(free_slots)
+        if r.status_code != 200:
+            return jsonify({"error": f"Supabase read failed: {r.status_code}"}), 500
+
+        rows = r.json()
+        result = {}
+        for row in rows:
+            slots = row.get("slots", [])
+            if isinstance(slots, str):
+                slots = json.loads(slots)
+            if slots:
+                result[row["date"]] = {"slots": slots}
+
+        logger.info(f"[timely] Returning {sum(len(d['slots']) for d in result.values())} cached slots across {len(result)} days")
+        return jsonify(result)
 
     except Exception as e:
-        logger.exception("[timely] Error checking availability")
+        logger.exception("[timely] Error reading cached availability")
         return jsonify({"error": str(e)}), 500
 
 
@@ -507,46 +509,38 @@ def book(clinic_slug=None):
 
         logger.info(f"[{slug}] GHL response: {r.status_code} - {r.text[:300]}")
 
-        # For Confiderm: also create booking in Timely via Playwright (background)
+        # For Confiderm: queue booking in Supabase for local bridge to create in Timely
         if slug == "confiderm" and r.status_code in (200, 201):
             try:
-                # Parse the slot to get date and time
-                # selected_slot format: "2026-05-12T10:00:00+10:00"
-                from datetime import datetime as dt_parse
-                slot_dt = dt_parse.fromisoformat(selected_slot.replace("+10:00", "").replace("+11:00", ""))
+                slot_dt = datetime.fromisoformat(selected_slot.replace("+10:00", "").replace("+11:00", ""))
                 booking_date = slot_dt.strftime("%Y-%m-%d")
                 booking_time = slot_dt.strftime("%-I:%M%p").lower()
 
-                cfg = clinic["timely"]
-
-                # Map practitioner - default Mojgan
-                staff_id = "486177"
-
                 logger.info(f"[confiderm] Queuing Timely booking: {first_name} on {booking_date} at {booking_time}")
 
-                def run_timely_booking():
-                    try:
-                        from timely_booking import create_timely_booking_requests
-                        result = create_timely_booking_requests(
-                            email=cfg["email"],
-                            password=cfg["password"],
-                            location_id=cfg["location_id"],
-                            customer_name=first_name or "Customer",
-                            customer_phone=phone,
-                            customer_email=email,
-                            staff_id=staff_id,
-                            booking_date=booking_date,
-                            booking_time=booking_time,
-                            service_key="skin_consultation",
-                        )
-                        logger.info(f"[confiderm] Timely booking result: {result}")
-                    except Exception as e:
-                        logger.exception(f"[confiderm] Timely booking failed: {e}")
-
-                thread = Thread(target=run_timely_booking)
-                thread.start()
-            except Exception as timely_err:
-                logger.warning(f"[confiderm] Timely booking queue failed: {timely_err}")
+                http_requests.post(
+                    f"{SUPABASE_URL}/rest/v1/aria_booking_queue",
+                    headers={
+                        "apikey": SUPABASE_KEY,
+                        "Authorization": f"Bearer {SUPABASE_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "clinic_slug": "confiderm",
+                        "customer_name": first_name or "Customer",
+                        "customer_phone": phone,
+                        "customer_email": email,
+                        "staff_id": "486177",
+                        "booking_date": booking_date,
+                        "booking_time": booking_time,
+                        "service_key": "skin_consultation",
+                        "status": "pending"
+                    },
+                    timeout=10
+                )
+                logger.info(f"[confiderm] Booking queued in Supabase for bridge pickup")
+            except Exception as q_err:
+                logger.warning(f"[confiderm] Booking queue failed: {q_err}")
 
         return r.text, r.status_code, {"Content-Type": "application/json"}
 
