@@ -507,33 +507,46 @@ def book(clinic_slug=None):
 
         logger.info(f"[{slug}] GHL response: {r.status_code} - {r.text[:300]}")
 
-        # For Confiderm: send SMS to Mojgan about the new booking
+        # For Confiderm: also create booking in Timely via Playwright (background)
         if slug == "confiderm" and r.status_code in (200, 201):
             try:
-                # Format the slot time nicely
-                slot_time = selected_slot[:16].replace("T", " at ")
-                sms_body = (
-                    f"Aria booked: {first_name or 'Customer'} for {slot_time}. "
-                    f"Phone: {phone}. Please add to Timely."
-                )
-                # Send SMS via GHL
-                http_requests.post(
-                    "https://services.leadconnectorhq.com/conversations/messages",
-                    headers={
-                        "Authorization": f"Bearer {clinic['ghl_key']}",
-                        "Version": "2021-04-15",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "type": "SMS",
-                        "message": sms_body,
-                        "contactId": "internal_notification"
-                    },
-                    timeout=10
-                )
-                logger.info(f"[confiderm] SMS notification sent to Mojgan: {sms_body}")
-            except Exception as sms_err:
-                logger.warning(f"[confiderm] SMS notification failed: {sms_err}")
+                # Parse the slot to get date and time
+                # selected_slot format: "2026-05-12T10:00:00+10:00"
+                from datetime import datetime as dt_parse
+                slot_dt = dt_parse.fromisoformat(selected_slot.replace("+10:00", "").replace("+11:00", ""))
+                booking_date = slot_dt.strftime("%Y-%m-%d")
+                booking_time = slot_dt.strftime("%-I:%M%p").lower()
+
+                cfg = clinic["timely"]
+
+                # Map practitioner - default Mojgan
+                staff_id = "486177"
+
+                logger.info(f"[confiderm] Queuing Timely booking: {first_name} on {booking_date} at {booking_time}")
+
+                def run_timely_booking():
+                    try:
+                        from timely_booking import create_booking_sync
+                        result = create_booking_sync(
+                            email=cfg["email"],
+                            password=cfg["password"],
+                            location_id=cfg["location_id"],
+                            customer_name=first_name or "Customer",
+                            customer_phone=phone,
+                            customer_email=email,
+                            staff_id=staff_id,
+                            booking_date=booking_date,
+                            booking_time=booking_time,
+                            service_name="Injectables Consultation",
+                        )
+                        logger.info(f"[confiderm] Timely booking result: {result}")
+                    except Exception as e:
+                        logger.exception(f"[confiderm] Timely booking failed: {e}")
+
+                thread = Thread(target=run_timely_booking)
+                thread.start()
+            except Exception as timely_err:
+                logger.warning(f"[confiderm] Timely booking queue failed: {timely_err}")
 
         return r.text, r.status_code, {"Content-Type": "application/json"}
 
