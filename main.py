@@ -480,69 +480,46 @@ def book(clinic_slug=None):
         if not selected_slot:
             return jsonify({"error": "No slot selected"}), 400
 
-        # Book in GHL (record keeping)
-        ghl_body = {
-            "calendarId": calendar_id,
-            "locationId": location_id,
-            "selectedSlot": selected_slot,
-            "selectedTimezone": selected_timezone,
-            "title": title,
-            "contact": {
-                "firstName": first_name or "Customer",
-                "email": email or "noemail@placeholder.com",
-                "phone": phone
+        # Parse the slot
+        slot_dt = datetime.fromisoformat(selected_slot.replace("+10:00", "").replace("+11:00", ""))
+        booking_date = slot_dt.strftime("%Y-%m-%d")
+        booking_time = slot_dt.strftime("%-I:%M%p").lower()
+
+        if slug == "confiderm":
+            # Queue booking in Supabase for bridge to create in Timely
+            logger.info(f"[confiderm] Queuing Timely booking: {first_name} on {booking_date} at {booking_time}")
+            http_requests.post(
+                f"{SUPABASE_URL}/rest/v1/aria_booking_queue",
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"},
+                json={
+                    "clinic_slug": "confiderm",
+                    "customer_name": first_name or "Customer",
+                    "customer_phone": phone,
+                    "customer_email": email,
+                    "staff_id": "486177",
+                    "booking_date": booking_date,
+                    "booking_time": booking_time,
+                    "service_key": "skin_consultation",
+                    "status": "pending"
+                },
+                timeout=10
+            )
+            logger.info(f"[confiderm] Booking queued for bridge pickup")
+            return jsonify({"status": "booked", "date": booking_date, "time": booking_time}), 200
+        else:
+            # Other clinics (Lumiere etc) still use GHL
+            ghl_body = {
+                "calendarId": calendar_id, "locationId": location_id,
+                "selectedSlot": selected_slot, "selectedTimezone": selected_timezone,
+                "title": title,
+                "contact": {"firstName": first_name or "Customer", "email": email or "noemail@placeholder.com", "phone": phone}
             }
-        }
-
-        logger.info(f"[{slug}] Booking to GHL: {json.dumps(ghl_body)}")
-
-        r = http_requests.post(
-            "https://services.leadconnectorhq.com/calendars/events/appointments",
-            headers={
-                "Authorization": f"Bearer {clinic['ghl_key']}",
-                "Version": "2021-04-15",
-                "Content-Type": "application/json"
-            },
-            json=ghl_body,
-            timeout=30
-        )
-
-        logger.info(f"[{slug}] GHL response: {r.status_code} - {r.text[:300]}")
-
-        # For Confiderm: queue booking in Supabase for local bridge to create in Timely
-        if slug == "confiderm" and r.status_code in (200, 201):
-            try:
-                slot_dt = datetime.fromisoformat(selected_slot.replace("+10:00", "").replace("+11:00", ""))
-                booking_date = slot_dt.strftime("%Y-%m-%d")
-                booking_time = slot_dt.strftime("%-I:%M%p").lower()
-
-                logger.info(f"[confiderm] Queuing Timely booking: {first_name} on {booking_date} at {booking_time}")
-
-                http_requests.post(
-                    f"{SUPABASE_URL}/rest/v1/aria_booking_queue",
-                    headers={
-                        "apikey": SUPABASE_KEY,
-                        "Authorization": f"Bearer {SUPABASE_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "clinic_slug": "confiderm",
-                        "customer_name": first_name or "Customer",
-                        "customer_phone": phone,
-                        "customer_email": email,
-                        "staff_id": "486177",
-                        "booking_date": booking_date,
-                        "booking_time": booking_time,
-                        "service_key": "skin_consultation",
-                        "status": "pending"
-                    },
-                    timeout=10
-                )
-                logger.info(f"[confiderm] Booking queued in Supabase for bridge pickup")
-            except Exception as q_err:
-                logger.warning(f"[confiderm] Booking queue failed: {q_err}")
-
-        return r.text, r.status_code, {"Content-Type": "application/json"}
+            r = http_requests.post(
+                "https://services.leadconnectorhq.com/calendars/events/appointments",
+                headers={"Authorization": f"Bearer {clinic['ghl_key']}", "Version": "2021-04-15", "Content-Type": "application/json"},
+                json=ghl_body, timeout=30
+            )
+            return r.text, r.status_code, {"Content-Type": "application/json"}
 
     except Exception as e:
         logger.exception(f"Error in book ({clinic_slug})")
