@@ -309,7 +309,7 @@ def health():
 
 
 SUPABASE_URL = "https://jiquevvzrdavgqonvvug.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImppcXVldnZ6cmRhdmdxb252dnVnIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTcyNzgzNTI3OCwiZXhwIjoyMDQzNDExMjc4fQ.SPhGPkjCbMPFGMYclMmTEcBQfOFPfEjVxZ3BBRY7-Gg"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImppcXVldnZ6cmRhdmdxb252dnVnIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MTk3MjE3MiwiZXhwIjoyMDg3NTQ4MTcyfQ.x2CFoCcJpyVApfnh5J77eT-UoMRRXdqhW9Xi-fK3hyE"
 
 
 @app.route("/timely/availability", methods=["GET"])
