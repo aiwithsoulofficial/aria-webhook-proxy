@@ -38,7 +38,7 @@ CLINICS = {
     },
     "confiderm": {
         "name": "Confiderm Skin Care",
-        "agent_id": os.environ.get("CONFIDERM_AGENT_ID", "agent_2201kr2kzb94emc9qc5cq8q9yexw"),
+        "agent_id": os.environ.get("CONFIDERM_AGENT_ID", "agent_9201kr2p97sse30b35bmhcjea535"),
         "agent_phone_id": os.environ.get("CONFIDERM_PHONE_ID", "phnum_4801kr2ma3p9ft4aq4j9r5yv89kf"),
         "ghl_key": os.environ.get("GHL_KEY_CONFIDERM", "pit-19355b7e-29d6-4ddf-a036-cbe661c92234"),
         "calendar_id": "H9z1MTWykO17vGy1q5rn",
